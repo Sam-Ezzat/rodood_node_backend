@@ -1,0 +1,1623 @@
+import {
+  User, InsertUser,
+  Page, InsertPage,
+  Conversation, InsertConversation,
+  Message, InsertMessage,
+  ApiConfig, InsertApiConfig,
+  Activity, InsertActivity,
+  UserPage, InsertUserPage,
+  UserState, InsertUserState,
+  DashboardMetrics,
+  DashboardInsight, InsertDashboardInsight,
+  SentimentDistribution, InsertSentimentDistribution,
+  InstagramMapping, InsertInstagramMapping,
+  OAuthState, InsertOAuthState,
+  // Import the actual schema tables
+  users,
+  pages,
+  conversations,
+  messages,
+  dashboardInsights,
+  sentimentDistribution,
+  apiConfigs,
+  activities,
+  userPages,
+  userStates,
+  instagramMappings,
+  oauthStates
+} from "@shared/schema";
+import { format, subDays } from "date-fns";
+
+// Storage interface for all data operations
+import session from "express-session";
+import createMemoryStore from "memorystore";
+import connectPg from "connect-pg-simple";
+import { db } from "./db";
+import { eq, and, desc, gte, lte, sql, count, sum, avg, isNotNull } from "drizzle-orm";
+import { pool } from "./db";
+
+// Create database session store
+const PostgresSessionStore = connectPg(session);
+
+// Create a memory store for session (fallback)
+const MemoryStore = createMemoryStore(session);
+
+export interface IStorage {
+  // User operations
+  getUser(id: number): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
+  getUserByEmail(email: string): Promise<User | undefined>;
+  createUser(user: InsertUser): Promise<User>;
+  
+  // Page operations
+  getPage(id: number): Promise<Page | undefined>;
+  getPageByPageId(pageId: string): Promise<Page | undefined>;
+  getPageById(pageId: string): Promise<Page | undefined>;
+  getAllPages(): Promise<Page[]>;
+  createPage(page: InsertPage): Promise<Page>;
+
+  updatePage(id: number, page: Partial<InsertPage>): Promise<Page | undefined>;
+  updatePage(pageId: string, page: Partial<InsertPage>): Promise<Page | undefined>;
+  deletePage(id: number): Promise<boolean>;
+  
+  // User-Page operations (for role-based access control)
+  getUserPages(userId: number): Promise<Page[]>;
+  getPageUsers(pageId: string): Promise<User[]>;
+  assignPageToUser(userId: number, pageId: string): Promise<UserPage>;
+  removePageFromUser(userId: number, pageId: string): Promise<boolean>;
+  isUserAuthorizedForPage(userId: number, pageId: string): Promise<boolean>;
+  
+  // Conversation operations
+  getConversation(id: number): Promise<Conversation | undefined>;
+  getConversationBySenderId(senderId: string, pageId: string): Promise<Conversation | undefined>;
+  getConversationsByPageId(pageId: string): Promise<Conversation[]>;
+  createConversation(conversation: InsertConversation): Promise<Conversation>;
+  updateConversation(id: number, data: Partial<Conversation>): Promise<Conversation | undefined>;
+  
+  // Message operations
+  getMessage(id: number): Promise<Message | undefined>;
+  getMessagesByConversation(conversationId: number): Promise<Message[]>;
+  createMessage(message: InsertMessage): Promise<Message>;
+  
+  // API Config operations
+  getApiConfig(service: string): Promise<ApiConfig | undefined>;
+  getAllApiConfigs(): Promise<ApiConfig[]>;
+  createApiConfig(config: InsertApiConfig): Promise<ApiConfig>;
+  updateApiConfig(id: number, config: Partial<InsertApiConfig>): Promise<ApiConfig | undefined>;
+  
+  // Activity operations
+  getRecentActivities(limit: number): Promise<Activity[]>;
+  createActivity(activity: InsertActivity): Promise<Activity>;
+  
+  // Dashboard metrics
+  getDashboardMetrics(days: number): Promise<DashboardMetrics>;
+  
+  // User State operations
+  getUserState(senderId: string): Promise<UserState | undefined>;
+  getUserStateByConversationId(conversationId: number): Promise<UserState | undefined>;
+  getUserStatesByPageId(pageId: string): Promise<UserState[]>;
+  createUserState(userState: InsertUserState): Promise<UserState>;
+  updateUserState(senderId: string, data: Partial<UserState>): Promise<UserState | undefined>;
+  
+  // Dashboard Insights operations
+  getDashboardInsight(pageId: string, timePeriod: string): Promise<DashboardInsight | undefined>;
+  getDashboardInsightById(id: number): Promise<DashboardInsight | undefined>;
+  createDashboardInsight(insight: InsertDashboardInsight): Promise<DashboardInsight>;
+  updateDashboardInsight(id: number, data: Partial<DashboardInsight>): Promise<DashboardInsight | undefined>;
+  deleteDashboardInsight(idOrPageId: number | string, timePeriod?: string): Promise<boolean>;
+  getDashboardInsightsForPage(pageId: string): Promise<DashboardInsight[]>;
+  
+  // Sentiment Distribution operations
+  getSentimentDistribution(pageId: string, startDate: Date, endDate: Date): Promise<any>;
+  getSentimentDistributionForSender(senderId: string): Promise<SentimentDistribution | undefined>;
+  createSentimentDistribution(sentiment: InsertSentimentDistribution): Promise<SentimentDistribution>;
+  updateSentimentDistribution(id: number, data: Partial<SentimentDistribution>): Promise<SentimentDistribution | undefined>;
+  
+  // OAuth state management for reliable user tracking
+  saveOAuthState(state: string, userId: number, platform: string): Promise<OAuthState>;
+  getOAuthState(state: string): Promise<OAuthState | undefined>;
+  deleteOAuthState(state: string): Promise<boolean>;
+  cleanupExpiredOAuthStates(): Promise<number>;
+  
+  // Session store
+  sessionStore: session.Store;
+}
+
+// In-memory implementation of the storage interface
+export class MemStorage implements IStorage {
+  private users: Map<number, User>;
+  private pages: Map<number, Page>;
+  private userPages: Map<number, UserPage>;
+  private conversations: Map<number, Conversation>;
+  private messages: Map<number, Message>;
+  private apiConfigs: Map<number, ApiConfig>;
+  private activities: Map<number, Activity>;
+  private userStates: Map<number, UserState>;
+  private dashboardInsights: Map<number, DashboardInsight>;
+  private sentimentDistributions: Map<number, SentimentDistribution>;
+  
+  // Session store for Express sessions
+  public sessionStore: session.Store;
+  
+  private userId: number;
+  private pageId: number;
+  private userPageId: number;
+  private conversationId: number;
+  private messageId: number;
+  private apiConfigId: number;
+  private activityId: number;
+  private userStateId: number;
+  private dashboardInsightId: number;
+  private sentimentDistributionId: number;
+  
+  constructor() {
+    this.users = new Map();
+    this.pages = new Map();
+    this.userPages = new Map();
+    this.conversations = new Map();
+    this.messages = new Map();
+    this.apiConfigs = new Map();
+    this.activities = new Map();
+    this.userStates = new Map();
+    this.dashboardInsights = new Map();
+    this.sentimentDistributions = new Map();
+    
+    // Initialize the session store
+    this.sessionStore = new MemoryStore({
+      checkPeriod: 86400000 // prune expired entries every 24h
+    });
+    
+    this.userId = 1;
+    this.pageId = 1;
+    this.userPageId = 1;
+    this.conversationId = 1;
+    this.messageId = 1;
+    this.apiConfigId = 1;
+    this.activityId = 1;
+    this.userStateId = 1;
+    this.dashboardInsightId = 1;
+    this.sentimentDistributionId = 1;
+    
+    // Initialize with default data - handle async properly
+    // We use a void promise to avoid blocking the constructor
+    (async () => {
+      try {
+        await this.initializeDefaultData();
+        console.log("Default data initialization completed successfully");
+      } catch (error) {
+        console.error("Error in default data initialization:", error);
+      }
+    })();
+  }
+  
+  private async initializeDefaultData() {
+    // No hardcoded synthetic data initialization
+    // System will only use authentic data from authorized OAuth connections
+    console.log("Skipping synthetic data initialization - system configured for authentic data only");
+  }
+  
+  // User operations
+  async getUser(id: number): Promise<User | undefined> {
+    return this.users.get(id);
+  }
+  
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    return Array.from(this.users.values()).find(
+      (user) => user.username === username
+    );
+  }
+  
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    return Array.from(this.users.values()).find(
+      (user) => user.email === email
+    );
+  }
+  
+  async createUser(user: InsertUser): Promise<User> {
+    const id = this.userId++;
+    const createdAt = new Date();
+    const newUser: User = { ...user, id, createdAt };
+    this.users.set(id, newUser);
+    return newUser;
+  }
+  
+  // Page operations
+  async getPage(id: number): Promise<Page | undefined> {
+    return this.pages.get(id);
+  }
+  
+  async getPageByPageId(pageId: string): Promise<Page | undefined> {
+    return Array.from(this.pages.values()).find(
+      (page) => page.pageId === pageId
+    );
+  }
+  
+  // Alias for getPageByPageId for use in the config bridge API
+  async getPageById(pageId: string): Promise<Page | undefined> {
+    return this.getPageByPageId(pageId);
+  }
+  
+  async getAllPages(): Promise<Page[]> {
+    // Return all pages that exist (are not deleted)
+    return Array.from(this.pages.values());
+  }
+  
+  async createPage(page: InsertPage): Promise<Page> {
+    const id = this.pageId++;
+    const createdAt = new Date();
+    const newPage: Page = { ...page, id, createdAt };
+    this.pages.set(id, newPage);
+    return newPage;
+  }
+  
+  async updatePage(idOrPageId: number | string, data: Partial<InsertPage>): Promise<Page | undefined> {
+    let page: Page | undefined;
+    
+    if (typeof idOrPageId === 'number') {
+      // Get page by numeric ID
+      page = this.pages.get(idOrPageId);
+    } else {
+      // Get page by string pageId
+      page = Array.from(this.pages.values()).find(p => p.pageId === idOrPageId);
+    }
+    
+    if (!page) return undefined;
+    
+    const updatedPage: Page = { ...page, ...data };
+    this.pages.set(page.id, updatedPage);
+    return updatedPage;
+  }
+  
+  async deletePage(id: number): Promise<boolean> {
+    const page = this.pages.get(id);
+    if (!page) return false;
+    
+    // Delete the page from the map
+    return this.pages.delete(id);
+  }
+  
+  // User-Page relationship operations
+  async getUserPages(userId: number): Promise<Page[]> {
+    // Get all user-page relationships for this user
+    const userPageEntries = Array.from(this.userPages.values()).filter(
+      (userPage) => userPage.userId === userId
+    );
+    
+    // Get the actual page objects
+    const pages: Page[] = [];
+    for (const entry of userPageEntries) {
+      const page = Array.from(this.pages.values()).find(
+        (p) => p.pageId === entry.pageId
+      );
+      if (page) {
+        pages.push(page);
+      }
+    }
+    
+    return pages;
+  }
+  
+  async getPageUsers(pageId: string): Promise<User[]> {
+    // Get all user-page relationships for this page
+    const userPageEntries = Array.from(this.userPages.values()).filter(
+      (userPage) => userPage.pageId === pageId
+    );
+    
+    // Get the actual user objects
+    const users: User[] = [];
+    for (const entry of userPageEntries) {
+      const user = this.users.get(entry.userId);
+      if (user) {
+        users.push(user);
+      }
+    }
+    
+    return users;
+  }
+  
+  async assignPageToUser(userId: number, pageId: string): Promise<UserPage> {
+    // Check if user exists
+    const user = this.users.get(userId);
+    if (!user) {
+      throw new Error(`User with ID ${userId} not found`);
+    }
+    
+    // Check if page exists
+    const page = Array.from(this.pages.values()).find(p => p.pageId === pageId);
+    if (!page) {
+      throw new Error(`Page with ID ${pageId} not found`);
+    }
+    
+    // Check if relationship already exists
+    const existingRelationship = Array.from(this.userPages.values()).find(
+      (up) => up.userId === userId && up.pageId === pageId
+    );
+    
+    if (existingRelationship) {
+      return existingRelationship;
+    }
+    
+    // Create new relationship
+    const id = this.userPageId++;
+    const createdAt = new Date();
+    const userPage: UserPage = {
+      id,
+      userId,
+      pageId,
+      createdAt
+    };
+    
+    this.userPages.set(id, userPage);
+    return userPage;
+  }
+  
+  async removePageFromUser(userId: number, pageId: string): Promise<boolean> {
+    // Find the user-page relationship
+    const relationship = Array.from(this.userPages.values()).find(
+      (up) => up.userId === userId && up.pageId === pageId
+    );
+    
+    if (!relationship) {
+      return false;
+    }
+    
+    // Remove it
+    return this.userPages.delete(relationship.id);
+  }
+  
+  async isUserAuthorizedForPage(userId: number, pageId: string): Promise<boolean> {
+    // Admin users have access to all pages
+    const user = this.users.get(userId);
+    if (user?.role === 'admin' || user?.isAdmin) {
+      return true;
+    }
+    
+    // Check if there's a specific relationship for this user and page
+    const relationship = Array.from(this.userPages.values()).find(
+      (up) => up.userId === userId && up.pageId === pageId
+    );
+    
+    return !!relationship;
+  }
+  
+  // Conversation operations
+  async getConversation(id: number): Promise<Conversation | undefined> {
+    return this.conversations.get(id);
+  }
+  
+  async getConversationBySenderId(senderId: string, pageId: string): Promise<Conversation | undefined> {
+    return Array.from(this.conversations.values()).find(
+      (convo) => convo.senderId === senderId && convo.pageId === pageId
+    );
+  }
+  
+  async getConversationsByPageId(pageId: string): Promise<Conversation[]> {
+    return Array.from(this.conversations.values()).filter(
+      (convo) => convo.pageId === pageId
+    );
+  }
+  
+  async createConversation(conversation: InsertConversation): Promise<Conversation> {
+    const id = this.conversationId++;
+    const createdAt = new Date();
+    const lastMessageAt = new Date();
+    const newConversation: Conversation = { 
+      ...conversation, 
+      id, 
+      createdAt, 
+      lastMessageAt,
+      messageCount: 0
+    };
+    this.conversations.set(id, newConversation);
+    return newConversation;
+  }
+  
+  async updateConversation(id: number, data: Partial<Conversation>): Promise<Conversation | undefined> {
+    const conversation = this.conversations.get(id);
+    if (!conversation) return undefined;
+    
+    const updatedConversation: Conversation = { ...conversation, ...data };
+    this.conversations.set(id, updatedConversation);
+    return updatedConversation;
+  }
+  
+  // Message operations
+  async getMessage(id: number): Promise<Message | undefined> {
+    return this.messages.get(id);
+  }
+  
+  async getMessagesByConversation(conversationId: number): Promise<Message[]> {
+    return Array.from(this.messages.values()).filter(
+      (message) => message.conversationId === conversationId
+    );
+  }
+  
+  async createMessage(message: InsertMessage): Promise<Message> {
+    const id = this.messageId++;
+    const sentAt = new Date();
+    const newMessage: Message = { ...message, id, sentAt };
+    this.messages.set(id, newMessage);
+    
+    // Update conversation message count and last message time
+    const conversation = this.conversations.get(message.conversationId);
+    if (conversation) {
+      this.conversations.set(message.conversationId, {
+        ...conversation,
+        messageCount: conversation.messageCount + 1,
+        lastMessageAt: sentAt
+      });
+    }
+    
+    return newMessage;
+  }
+  
+  // API Config operations
+  async getApiConfig(service: string): Promise<ApiConfig | undefined> {
+    return Array.from(this.apiConfigs.values()).find(
+      (config) => config.service === service
+    );
+  }
+  
+  async getAllApiConfigs(): Promise<ApiConfig[]> {
+    return Array.from(this.apiConfigs.values());
+  }
+  
+  async createApiConfig(config: InsertApiConfig): Promise<ApiConfig> {
+    const id = this.apiConfigId++;
+    const newConfig: ApiConfig = { 
+      ...config, 
+      id, 
+      lastCheckedAt: new Date()
+    };
+    this.apiConfigs.set(id, newConfig);
+    return newConfig;
+  }
+  
+  async updateApiConfig(id: number, data: Partial<InsertApiConfig>): Promise<ApiConfig | undefined> {
+    const config = this.apiConfigs.get(id);
+    if (!config) return undefined;
+    
+    const updatedConfig: ApiConfig = { ...config, ...data };
+    this.apiConfigs.set(id, updatedConfig);
+    return updatedConfig;
+  }
+  
+  // Activity operations
+  async getRecentActivities(limit: number): Promise<Activity[]> {
+    return Array.from(this.activities.values())
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, limit);
+  }
+  
+  async createActivity(activity: InsertActivity): Promise<Activity> {
+    const id = this.activityId++;
+    const createdAt = new Date();
+    const newActivity: Activity = { ...activity, id, createdAt };
+    this.activities.set(id, newActivity);
+    return newActivity;
+  }
+  
+  // User State operations
+  async getUserState(senderId: string): Promise<UserState | undefined> {
+    return Array.from(this.userStates.values()).find(
+      (state) => state.senderId === senderId
+    );
+  }
+  
+  async getUserStateByConversationId(conversationId: number): Promise<UserState | undefined> {
+    return Array.from(this.userStates.values()).find(
+      (state) => state.conversationId === conversationId
+    );
+  }
+  
+  async getUserStatesByPageId(pageId: string): Promise<UserState[]> {
+    return Array.from(this.userStates.values()).filter(
+      (state) => state.pageId === pageId
+    );
+  }
+  
+  async createUserState(userState: InsertUserState): Promise<UserState> {
+    const id = this.userStateId++;
+    const createdAt = new Date();
+    const updatedAt = new Date();
+    const newUserState: UserState = { 
+      ...userState, 
+      id, 
+      createdAt, 
+      updatedAt 
+    };
+    this.userStates.set(id, newUserState);
+    return newUserState;
+  }
+  
+  async updateUserState(senderId: string, data: Partial<UserState>): Promise<UserState | undefined> {
+    const state = Array.from(this.userStates.values()).find(
+      (state) => state.senderId === senderId
+    );
+    
+    if (!state) return undefined;
+    
+    const updatedAt = new Date();
+    const updatedState: UserState = { ...state, ...data, updatedAt };
+    this.userStates.set(state.id, updatedState);
+    return updatedState;
+  }
+  
+  // Dashboard metrics
+  async getDashboardMetrics(days: number = 7): Promise<DashboardMetrics> {
+    const now = new Date();
+    const allConversations = Array.from(this.conversations.values());
+    const allMessages = Array.from(this.messages.values());
+    
+    // Filter messages for last 'days'
+    const recentMessages = allMessages.filter(msg => {
+      const msgDate = new Date(msg.sentAt);
+      return msg.sender === 'bot' && msgDate >= subDays(now, days);
+    });
+    
+    // Calculate response times for bot messages
+    const responseTimesMs = recentMessages
+      .filter(msg => msg.responseTime !== undefined && msg.responseTime !== null)
+      .map(msg => msg.responseTime as number);
+    
+    const avgResponseTimeMs = responseTimesMs.length > 0
+      ? responseTimesMs.reduce((sum, time) => sum + time, 0) / responseTimesMs.length
+      : 0;
+    
+    // Calculate completion rate
+    // (Messages with response time / total bot messages) * 100
+    const completionRate = recentMessages.length > 0
+      ? responseTimesMs.length / recentMessages.length
+      : 0;
+    
+    // Generate daily conversation count
+    const conversationTrend = [];
+    for (let i = 0; i < days; i++) {
+      const date = subDays(now, i);
+      const dateStr = format(date, 'yyyy-MM-dd');
+      
+      // Count conversations created on this date
+      const count = allConversations.filter(convo => {
+        const convoDate = format(new Date(convo.createdAt), 'yyyy-MM-dd');
+        return convoDate === dateStr;
+      }).length;
+      
+      conversationTrend.unshift({ date: dateStr, count });
+    }
+    
+    return {
+      totalConversations: allConversations.length,
+      averageResponseTime: avgResponseTimeMs / 1000, // convert to seconds
+      completionRate,
+      conversationTrend
+    };
+  }
+  
+  // Utility function to get sentiment label based on rank
+  private getSentimentLabel(rank: number): string {
+    if (rank >= 4.5) return "Rank 5.0 / 5.0";
+    if (rank >= 3.5) return "Rank 4.0 / 5.0";
+    if (rank >= 2.5) return "Rank 3.0 / 5.0";
+    if (rank >= 1.5) return "Rank 2.0 / 5.0";
+    return "Rank 1.0 / 5.0";
+  }
+  
+  // Dashboard Insights operations
+  async getDashboardInsight(pageId: string, timePeriod: string): Promise<DashboardInsight | undefined> {
+    return Array.from(this.dashboardInsights.values()).find(
+      insight => insight.pageId === pageId && insight.timePeriod === timePeriod
+    );
+  }
+  
+  async getDashboardInsightById(id: number): Promise<DashboardInsight | undefined> {
+    return this.dashboardInsights.get(id);
+  }
+  
+  async createDashboardInsight(insight: InsertDashboardInsight): Promise<DashboardInsight> {
+    const id = this.dashboardInsightId++;
+    const createdAt = new Date();
+    const updatedAt = new Date();
+    const newInsight: DashboardInsight = { 
+      ...insight, 
+      id, 
+      createdAt, 
+      updatedAt 
+    };
+    this.dashboardInsights.set(id, newInsight);
+    return newInsight;
+  }
+  
+  async updateDashboardInsight(id: number, data: Partial<DashboardInsight>): Promise<DashboardInsight | undefined> {
+    const insight = this.dashboardInsights.get(id);
+    if (!insight) return undefined;
+    
+    const updatedAt = new Date();
+    const updatedInsight: DashboardInsight = { ...insight, ...data, updatedAt };
+    this.dashboardInsights.set(id, updatedInsight);
+    return updatedInsight;
+  }
+  
+  async deleteDashboardInsight(idOrPageId: number | string, timePeriod?: string): Promise<boolean> {
+    try {
+      if (typeof idOrPageId === 'number') {
+        // Delete by numeric ID
+        const exists = this.dashboardInsights.has(idOrPageId);
+        if (exists) {
+          this.dashboardInsights.delete(idOrPageId);
+          return true;
+        }
+        return false;
+      } else if (timePeriod) {
+        // Delete by pageId and timePeriod
+        console.log(`[storage] Deleting dashboard insight for page ${idOrPageId}, period ${timePeriod}`);
+        
+        // Find matching insight
+        const insightToDelete = Array.from(this.dashboardInsights.values()).find(
+          insight => insight.pageId === idOrPageId && insight.timePeriod === timePeriod
+        );
+        
+        if (insightToDelete) {
+          return this.dashboardInsights.delete(insightToDelete.id);
+        }
+        return false;
+      } else {
+        // Delete all insights for this page
+        console.log(`[storage] Deleting all dashboard insights for page ${idOrPageId}`);
+        
+        // Find all insights for this page
+        const insightsToDelete = Array.from(this.dashboardInsights.values())
+          .filter(insight => insight.pageId === idOrPageId);
+        
+        // Delete each one
+        let success = true;
+        for (const insight of insightsToDelete) {
+          if (!this.dashboardInsights.delete(insight.id)) {
+            success = false;
+          }
+        }
+        return success;
+      }
+    } catch (error) {
+      console.error(`[storage] Error deleting dashboard insight:`, error);
+      return false;
+    }
+  }
+  
+  async getDashboardInsightsForPage(pageId: string): Promise<DashboardInsight[]> {
+    return Array.from(this.dashboardInsights.values()).filter(
+      insight => insight.pageId === pageId
+    );
+  }
+  
+  // Sentiment Distribution operations
+  async getSentimentDistribution(pageId: string, startDate: Date, endDate: Date): Promise<any> {
+    const distributions = Array.from(this.sentimentDistributions.values()).filter(
+      dist => dist.pageId === pageId && 
+             dist.createdAt >= startDate && 
+             dist.createdAt <= endDate
+    );
+    
+    // Count by rank
+    const distributionByRank = new Map<number, number>();
+    let totalRank = 0;
+    
+    distributions.forEach(dist => {
+      const roundedRank = Math.round(dist.rank);
+      const count = distributionByRank.get(roundedRank) || 0;
+      distributionByRank.set(roundedRank, count + 1);
+      totalRank += dist.rank;
+    });
+    
+    // Calculate average sentiment
+    const averageSentiment = distributions.length > 0 ? totalRank / distributions.length : 0;
+    
+    // Format result
+    const distribution = Array.from(distributionByRank.entries()).map(([rank, count]) => ({
+      rank,
+      count,
+      label: this.getSentimentLabel(rank)
+    }));
+    
+    return {
+      distribution,
+      averageSentiment
+    };
+  }
+  
+  async getSentimentDistributionForSender(senderId: string): Promise<SentimentDistribution | undefined> {
+    return Array.from(this.sentimentDistributions.values()).find(
+      dist => dist.senderId === senderId
+    );
+  }
+  
+  async createSentimentDistribution(sentiment: InsertSentimentDistribution): Promise<SentimentDistribution> {
+    const id = this.sentimentDistributionId++;
+    const createdAt = new Date();
+    const updatedAt = new Date();
+    
+    const newSentiment: SentimentDistribution = {
+      ...sentiment,
+      id,
+      createdAt,
+      updatedAt
+    };
+    
+    this.sentimentDistributions.set(id, newSentiment);
+    return newSentiment;
+  }
+  
+  async updateSentimentDistribution(id: number, data: Partial<SentimentDistribution>): Promise<SentimentDistribution | undefined> {
+    const sentiment = this.sentimentDistributions.get(id);
+    if (!sentiment) return undefined;
+    
+    const updatedAt = new Date();
+    const updatedSentiment: SentimentDistribution = { ...sentiment, ...data, updatedAt };
+    this.sentimentDistributions.set(id, updatedSentiment);
+    return updatedSentiment;
+  }
+}
+
+// Database implementation of the storage interface
+export class DatabaseStorage implements IStorage {
+  // Session store for Express sessions
+  public sessionStore: session.Store;
+
+  constructor() {
+    // Initialize the session store with PostgreSQL
+    this.sessionStore = new PostgresSessionStore({
+      pool,
+      createTableIfMissing: true
+    });
+  }
+
+  // User operations
+  async getUser(id: number): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user;
+  }
+
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    return user;
+  }
+
+  async createUser(user: InsertUser): Promise<User> {
+    const [newUser] = await db.insert(users).values(user).returning();
+    return newUser;
+  }
+
+  // Page operations
+  async getPage(id: number): Promise<Page | undefined> {
+    const [page] = await db.select().from(pages).where(eq(pages.id, id));
+    return page;
+  }
+
+  async getPageByPageId(pageId: string): Promise<Page | undefined> {
+    const [page] = await db.select().from(pages).where(eq(pages.pageId, pageId));
+    return page;
+  }
+  
+  // Alias for getPageByPageId for use in the config bridge API
+  async getPageById(pageId: string): Promise<Page | undefined> {
+    return this.getPageByPageId(pageId);
+  }
+
+  async getAllPages(): Promise<Page[]> {
+    try {
+      console.log('[storage] Fetching all pages from database...');
+      const results = await db.select().from(pages).orderBy(desc(pages.createdAt));
+      console.log(`[storage] Retrieved ${results.length} pages from database`);
+      return results;
+    } catch (error) {
+      console.error('[storage] Error in getAllPages:', error);
+      // Return empty array instead of throwing to prevent cascading errors
+      return [];
+    }
+  }
+
+  async createPage(page: InsertPage): Promise<Page> {
+    const [newPage] = await db.insert(pages).values(page).returning();
+    return newPage;
+  }
+
+  async updatePage(idOrPageId: number | string, data: Partial<InsertPage>): Promise<Page | undefined> {
+    let updatedPage;
+    
+    if (typeof idOrPageId === 'number') {
+      // Update by numeric ID
+      [updatedPage] = await db
+        .update(pages)
+        .set(data)
+        .where(eq(pages.id, idOrPageId))
+        .returning();
+    } else {
+      // Update by string pageId
+      [updatedPage] = await db
+        .update(pages)
+        .set(data)
+        .where(eq(pages.pageId, idOrPageId))
+        .returning();
+    }
+    
+    return updatedPage;
+  }
+
+  async deletePage(id: number): Promise<boolean> {
+    try {
+      // First, get the page to find its pageId
+      const [page] = await db.select().from(pages).where(eq(pages.id, id));
+      
+      if (!page) {
+        console.log(`Page with id ${id} not found`);
+        return false;
+      }
+      
+      // Delete in a transaction to ensure all related data is removed
+      return await db.transaction(async (tx) => {
+        if (page.pageId) {
+          // Delete all related data in the correct order to avoid foreign key violations
+          
+          // 1. First, delete dashboard insights for this page
+          console.log(`Deleting dashboard insights for page ${page.pageId}`);
+          await tx.delete(dashboardInsights).where(eq(dashboardInsights.pageId, page.pageId));
+          
+          // 2. Delete sentiment distribution data
+          console.log(`Deleting sentiment distribution data for page ${page.pageId}`);
+          await tx.delete(sentimentDistribution).where(eq(sentimentDistribution.pageId, page.pageId));
+          
+          // 3. Delete user states associated with this page
+          console.log(`Deleting user states for page ${page.pageId}`);
+          await tx.delete(userStates).where(eq(userStates.pageId, page.pageId));
+          
+          // 4. Delete user-page relationships
+          console.log(`Deleting user-page relationships for page ${page.pageId}`);
+          await tx.delete(userPages).where(eq(userPages.pageId, page.pageId));
+          
+          // 5. Delete messages from conversations on this page
+          console.log(`Deleting messages from conversations on page ${page.pageId}`);
+          // Find all conversations for this page
+          const pageConversations = await tx.select({ id: conversations.id })
+            .from(conversations)
+            .where(eq(conversations.pageId, page.pageId));
+            
+          // Delete messages from these conversations
+          if (pageConversations.length > 0) {
+            const conversationIds = pageConversations.map(conv => conv.id);
+            for (const convId of conversationIds) {
+              await tx.delete(messages).where(eq(messages.conversationId, convId));
+            }
+          }
+          
+          // 6. Delete conversations
+          console.log(`Deleting conversations for page ${page.pageId}`);
+          await tx.delete(conversations).where(eq(conversations.pageId, page.pageId));
+        }
+        
+        // Finally, delete the page itself
+        console.log(`Deleting page ${id} (pageId: ${page.pageId})`);
+        await tx.delete(pages).where(eq(pages.id, id));
+        
+        // Success if we got this far
+        return true;
+      });
+    } catch (error) {
+      console.error("Error in deletePage:", error);
+      throw error;
+    }
+  }
+
+  // User-Page relationships
+  async getUserPages(userId: number): Promise<Page[]> {
+    try {
+      console.log(`[storage] Fetching pages for user ID: ${userId}`);
+      const results = await db
+        .select({
+          id: pages.id,
+          pageId: pages.pageId,
+          name: pages.name,
+          platform: pages.platform,
+          accessToken: pages.accessToken,
+          status: pages.status,
+          assistantId: pages.assistantId,
+          createdAt: pages.createdAt
+        })
+        .from(userPages)
+        .innerJoin(pages, eq(userPages.pageId, pages.pageId))
+        .where(eq(userPages.userId, userId));
+      
+      console.log(`[storage] Retrieved ${results.length} pages for user ID: ${userId}`);
+      return results;
+    } catch (error) {
+      console.error(`[storage] Error getting pages for user ID ${userId}:`, error);
+      // Return empty array instead of throwing to prevent cascading errors
+      return [];
+    }
+  }
+
+  async getPageUsers(pageId: string): Promise<User[]> {
+    return await db
+      .select({
+        id: users.id,
+        username: users.username,
+        password: users.password,
+        email: users.email,
+        role: users.role,
+        isAdmin: users.isAdmin,
+        createdAt: users.createdAt,
+      })
+      .from(userPages)
+      .innerJoin(users, eq(userPages.userId, users.id))
+      .where(eq(userPages.pageId, pageId));
+  }
+
+  async assignPageToUser(userId: number, pageId: string): Promise<UserPage> {
+    try {
+      // First check if this user-page relationship already exists to prevent duplicates
+      const existingRelationship = await db
+        .select()
+        .from(userPages)
+        .where(
+          and(
+            eq(userPages.userId, userId),
+            eq(userPages.pageId, pageId)
+          )
+        );
+      
+      // If relationship already exists, return it
+      if (existingRelationship.length > 0) {
+        console.log(`Relationship between user ${userId} and page ${pageId} already exists`);
+        return existingRelationship[0];
+      }
+      
+      // Create the relationship
+      console.log(`Creating relationship between user ${userId} and page ${pageId}`);
+      const [userPage] = await db
+        .insert(userPages)
+        .values({ 
+          userId, 
+          pageId,
+          createdAt: new Date()
+        })
+        .returning();
+      
+      console.log(`Successfully created relationship between user ${userId} and page ${pageId}`);
+      return userPage;
+    } catch (error) {
+      console.error(`Error assigning page ${pageId} to user ${userId}:`, error);
+      throw error;
+    }
+  }
+
+  async removePageFromUser(userId: number, pageId: string): Promise<boolean> {
+    const result = await db
+      .delete(userPages)
+      .where(
+        and(
+          eq(userPages.userId, userId),
+          eq(userPages.pageId, pageId)
+        )
+      );
+    return result.count > 0;
+  }
+
+  async isUserAuthorizedForPage(userId: number, pageId: string): Promise<boolean> {
+    // First check if user is admin
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, userId));
+    
+    if (user && (user.isAdmin || user.role === 'admin')) {
+      return true;
+    }
+    
+    // Otherwise check if they have explicit access
+    const [userPage] = await db
+      .select()
+      .from(userPages)
+      .where(
+        and(
+          eq(userPages.userId, userId),
+          eq(userPages.pageId, pageId)
+        )
+      );
+    
+    return !!userPage;
+  }
+
+  // Conversation operations
+  async getConversation(id: number): Promise<Conversation | undefined> {
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(eq(conversations.id, id));
+    return conversation;
+  }
+
+  async getConversationBySenderId(senderId: string, pageId: string): Promise<Conversation | undefined> {
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.senderId, senderId),
+          eq(conversations.pageId, pageId)
+        )
+      )
+      .orderBy(desc(conversations.createdAt))
+      .limit(1);
+    return conversation;
+  }
+
+  async getConversationsByPageId(pageId: string): Promise<Conversation[]> {
+    return await db
+      .select()
+      .from(conversations)
+      .where(eq(conversations.pageId, pageId))
+      .orderBy(desc(conversations.createdAt));
+  }
+
+  async createConversation(conversation: InsertConversation): Promise<Conversation> {
+    const [newConversation] = await db
+      .insert(conversations)
+      .values(conversation)
+      .returning();
+    return newConversation;
+  }
+
+  async updateConversation(id: number, data: Partial<Conversation>): Promise<Conversation | undefined> {
+    const [updatedConversation] = await db
+      .update(conversations)
+      .set(data)
+      .where(eq(conversations.id, id))
+      .returning();
+    return updatedConversation;
+  }
+
+  // Message operations
+  async getMessage(id: number): Promise<Message | undefined> {
+    const [message] = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.id, id));
+    return message;
+  }
+
+  async getMessagesByConversation(conversationId: number): Promise<Message[]> {
+    return await db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .orderBy(messages.sentAt);
+  }
+
+  async createMessage(message: InsertMessage): Promise<Message> {
+    const [newMessage] = await db
+      .insert(messages)
+      .values(message)
+      .returning();
+    return newMessage;
+  }
+
+  // API Config operations
+  async getApiConfig(service: string): Promise<ApiConfig | undefined> {
+    const [config] = await db
+      .select()
+      .from(apiConfigs)
+      .where(eq(apiConfigs.service, service));
+    return config;
+  }
+
+  async getAllApiConfigs(): Promise<ApiConfig[]> {
+    return await db
+      .select()
+      .from(apiConfigs);
+  }
+
+  async createApiConfig(config: InsertApiConfig): Promise<ApiConfig> {
+    const [newConfig] = await db
+      .insert(apiConfigs)
+      .values(config)
+      .returning();
+    return newConfig;
+  }
+
+  async updateApiConfig(id: number, config: Partial<InsertApiConfig>): Promise<ApiConfig | undefined> {
+    const [updatedConfig] = await db
+      .update(apiConfigs)
+      .set(config)
+      .where(eq(apiConfigs.id, id))
+      .returning();
+    return updatedConfig;
+  }
+
+  // Activity operations
+  async getRecentActivities(limit: number): Promise<Activity[]> {
+    return await db
+      .select()
+      .from(activities)
+      .orderBy(desc(activities.createdAt))
+      .limit(limit);
+  }
+
+  async createActivity(activity: InsertActivity): Promise<Activity> {
+    const [newActivity] = await db
+      .insert(activities)
+      .values(activity)
+      .returning();
+    return newActivity;
+  }
+
+  // User State operations
+  async getUserState(senderId: string): Promise<UserState | undefined> {
+    const [userState] = await db
+      .select()
+      .from(userStates)
+      .where(eq(userStates.senderId, senderId));
+    return userState;
+  }
+
+  async getUserStateByConversationId(conversationId: number): Promise<UserState | undefined> {
+    const [userState] = await db
+      .select()
+      .from(userStates)
+      .where(eq(userStates.conversationId, conversationId));
+    return userState;
+  }
+
+  async getUserStatesByPageId(pageId: string): Promise<UserState[]> {
+    return await db
+      .select()
+      .from(userStates)
+      .where(eq(userStates.pageId, pageId));
+  }
+
+  async createUserState(userState: InsertUserState): Promise<UserState> {
+    const [newUserState] = await db
+      .insert(userStates)
+      .values(userState)
+      .returning();
+    return newUserState;
+  }
+
+  async updateUserState(senderId: string, data: Partial<UserState>): Promise<UserState | undefined> {
+    const [updatedUserState] = await db
+      .update(userStates)
+      .set({ ...data, updatedAt: new Date() })
+      .where(eq(userStates.senderId, senderId))
+      .returning();
+    return updatedUserState;
+  }
+
+  // Dashboard metrics
+  async getDashboardMetrics(days: number = 7): Promise<DashboardMetrics> {
+    // Calculate the date range
+    const endDate = new Date();
+    const startDate = subDays(endDate, days);
+
+    // Get total conversation count
+    const [{ value: totalConversations }] = await db
+      .select({
+        value: count()
+      })
+      .from(conversations)
+      .where(gte(conversations.createdAt, startDate));
+
+    // Get response time metrics
+    const responseTimeResult = await db
+      .select({
+        avgTime: sql`AVG(${messages.responseTime})`,
+      })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.sender, 'bot'),
+          gte(messages.sentAt, startDate),
+          sql`${messages.responseTime} IS NOT NULL`
+        )
+      );
+
+    // Calculate average response time in seconds
+    const averageResponseTime = responseTimeResult[0]?.avgTime
+      ? Number(responseTimeResult[0].avgTime) / 1000 // Convert ms to seconds
+      : 0;
+    
+    // Get completion rate (conversations with at least one bot response)
+    // Step 1: Get conversations with bot messages
+    const [{ value: conversationsWithResponses }] = await db
+      .select({
+        value: count(messages.conversationId, { distinct: true })
+      })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.sender, 'bot'),
+          gte(messages.sentAt, startDate)
+        )
+      );
+    
+    // Calculate completion rate
+    const completionRate = totalConversations > 0
+      ? conversationsWithResponses / totalConversations
+      : 0;
+    
+    // Get conversation trend data
+    const dateFormat = 'yyyy-MM-dd';
+    const conversationTrend = [];
+    
+    // Generate all dates in the range
+    for (let i = 0; i < days; i++) {
+      const date = subDays(endDate, i);
+      const dateStr = format(date, dateFormat);
+      conversationTrend.push({
+        date: dateStr,
+        count: 0
+      });
+    }
+    
+    // Get actual conversation counts per day
+    const trendResult = await db
+      .select({
+        date: sql`TO_CHAR(${conversations.createdAt}, 'YYYY-MM-DD')`,
+        count: count()
+      })
+      .from(conversations)
+      .where(gte(conversations.createdAt, startDate))
+      .groupBy(sql`TO_CHAR(${conversations.createdAt}, 'YYYY-MM-DD')`)
+      .orderBy(sql`TO_CHAR(${conversations.createdAt}, 'YYYY-MM-DD')`);
+    
+    // Update conversation trend with actual data
+    trendResult.forEach(row => {
+      const trendItem = conversationTrend.find(item => item.date === row.date);
+      if (trendItem) {
+        trendItem.count = Number(row.count);
+      }
+    });
+    
+    // Sort trend by date
+    conversationTrend.sort((a, b) => a.date.localeCompare(b.date));
+
+    // Get total bot messages
+    const [{ value: totalBotMessages }] = await db
+      .select({
+        value: count()
+      })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.sender, 'bot'),
+          gte(messages.sentAt, startDate)
+        )
+      );
+
+    // Return formatted dashboard metrics
+    return {
+      totalConversations,
+      averageResponseTime,
+      completionRate,
+      conversationTrend,
+      // These will be fetched from the Python API separately
+      sentimentDistribution: []
+    };
+  }
+  
+  // Utility function to get sentiment label based on rank
+  private getSentimentLabel(rank: number): string {
+    if (rank >= 4.5) return "Rank 5.0 / 5.0";
+    if (rank >= 3.5) return "Rank 4.0 / 5.0";
+    if (rank >= 2.5) return "Rank 3.0 / 5.0";
+    if (rank >= 1.5) return "Rank 2.0 / 5.0";
+    return "Rank 1.0 / 5.0";
+  }
+  
+  // Dashboard Insights operations
+  async getDashboardInsight(pageId: string, timePeriod: string): Promise<DashboardInsight | undefined> {
+    const [insight] = await db
+      .select()
+      .from(dashboardInsights)
+      .where(
+        and(
+          eq(dashboardInsights.pageId, pageId),
+          eq(dashboardInsights.timePeriod, timePeriod)
+        )
+      );
+    return insight;
+  }
+  
+  async getDashboardInsightById(id: number): Promise<DashboardInsight | undefined> {
+    const [insight] = await db
+      .select()
+      .from(dashboardInsights)
+      .where(eq(dashboardInsights.id, id));
+    return insight;
+  }
+  
+  async createDashboardInsight(insight: InsertDashboardInsight): Promise<DashboardInsight> {
+    const [newInsight] = await db
+      .insert(dashboardInsights)
+      .values({
+        ...insight,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      })
+      .returning();
+    return newInsight;
+  }
+  
+  async updateDashboardInsight(id: number, data: Partial<DashboardInsight>): Promise<DashboardInsight | undefined> {
+    const [updatedInsight] = await db
+      .update(dashboardInsights)
+      .set({ 
+        ...data, 
+        updatedAt: new Date() 
+      })
+      .where(eq(dashboardInsights.id, id))
+      .returning();
+    return updatedInsight;
+  }
+  
+  async deleteDashboardInsight(idOrPageId: number | string, timePeriod?: string): Promise<boolean> {
+    try {
+      let result;
+      
+      if (typeof idOrPageId === 'number') {
+        // Delete by numeric ID (this is the row ID, not pageId)
+        result = await db
+          .delete(dashboardInsights)
+          .where(eq(dashboardInsights.id, idOrPageId));
+      } else if (timePeriod) {
+        // Delete by pageId (string) and timePeriod
+        console.log(`[storage] Deleting dashboard insight for page ${idOrPageId}, period ${timePeriod}`);
+        
+        // First, find the insight ID by querying with the pageId and timePeriod
+        const [insight] = await db
+          .select({ id: dashboardInsights.id })
+          .from(dashboardInsights)
+          .where(and(
+            eq(dashboardInsights.pageId, idOrPageId),
+            eq(dashboardInsights.timePeriod, timePeriod)
+          ));
+        
+        if (insight) {
+          // Delete using the numeric ID which is safe
+          result = await db
+            .delete(dashboardInsights)
+            .where(eq(dashboardInsights.id, insight.id));
+        } else {
+          // Nothing to delete
+          console.log(`[storage] No dashboard insight found for page ${idOrPageId}, period ${timePeriod}`);
+          return true;
+        }
+      } else {
+        // Delete all insights for this page
+        console.log(`[storage] Deleting all dashboard insights for page ${idOrPageId}`);
+        
+        // Find all insight IDs for this page
+        const insights = await db
+          .select({ id: dashboardInsights.id })
+          .from(dashboardInsights)
+          .where(eq(dashboardInsights.pageId, idOrPageId));
+        
+        // Delete each one individually by ID
+        for (const insight of insights) {
+          await db
+            .delete(dashboardInsights)
+            .where(eq(dashboardInsights.id, insight.id));
+        }
+      }
+      
+      // Since we're being careful with our deletes, we'll return true as long as no error occurred
+      return true;
+    } catch (error) {
+      console.error(`[storage] Error deleting dashboard insight:`, error);
+      return false;
+    }
+  }
+
+  async getDashboardInsightsForPage(pageId: string): Promise<DashboardInsight[]> {
+    return await db
+      .select()
+      .from(dashboardInsights)
+      .where(eq(dashboardInsights.pageId, pageId))
+      .orderBy(desc(dashboardInsights.date));
+  }
+  
+  // Sentiment Distribution operations
+  async getSentimentDistribution(pageId: string, startDate: Date, endDate: Date): Promise<any> {
+    console.log(`[storage] Fetching sentiment distribution for page ${pageId} from ${startDate.toISOString()} to ${endDate.toISOString()}`);
+    
+    // Initialize distributions for all ranks 1-5 with zero count
+    const distributionByRank = new Map<number, number>([
+      [1, 0], [2, 0], [3, 0], [4, 0], [5, 0]
+    ]);
+    
+    let totalRank = 0;
+    let totalItems = 0;
+    
+    // Get all sentiment distributions for the page in the date range
+    const distributions = await db
+      .select()
+      .from(sentimentDistribution)
+      .where(
+        and(
+          eq(sentimentDistribution.pageId, pageId),
+          gte(sentimentDistribution.createdAt, startDate),
+          lte(sentimentDistribution.createdAt, endDate)
+        )
+      );
+    
+    console.log(`[storage] Found ${distributions.length} records in sentiment_distribution table`);
+    
+    // Add sentiment distribution records
+    distributions.forEach(dist => {
+      const roundedRank = Math.round(dist.rank);
+      // Ensure rank is between 1-5
+      if (roundedRank >= 1 && roundedRank <= 5) {
+        const count = distributionByRank.get(roundedRank) || 0;
+        distributionByRank.set(roundedRank, count + 1);
+        totalRank += dist.rank;
+        totalItems++;
+      }
+    });
+    
+    // Also get ranks from user_states table for the same page and date range
+    const userStatesWithRank = await db
+      .select()
+      .from(userStates)
+      .where(
+        and(
+          eq(userStates.pageId, pageId),
+          gte(userStates.updatedAt, startDate),
+          lte(userStates.updatedAt, endDate),
+          isNotNull(userStates.rank)
+        )
+      );
+    
+    console.log(`[storage] Found ${userStatesWithRank.length} records in user_states table with rank`);
+    
+    // Add user_states ranks
+    userStatesWithRank.forEach(state => {
+      if (state.rank && state.rank >= 1 && state.rank <= 5) {
+        const roundedRank = Math.round(state.rank);
+        const count = distributionByRank.get(roundedRank) || 0;
+        distributionByRank.set(roundedRank, count + 1);
+        totalRank += state.rank;
+        totalItems++;
+      }
+    });
+    
+    // Calculate average sentiment
+    const averageSentiment = totalItems > 0 ? totalRank / totalItems : 0;
+    
+    // Format result for the API response - ensure all ranks 1-5 are included
+    const distribution = Array.from(distributionByRank.entries()).map(([rank, count]) => ({
+      rank,
+      count,
+      label: this.getSentimentLabel(rank)
+    }));
+    
+    console.log(`[storage] Generated sentiment distribution with ${totalItems} total items, distribution:`, distribution);
+    
+    return {
+      distribution,
+      averageSentiment
+    };
+  }
+  
+  async getSentimentDistributionForSender(senderId: string): Promise<SentimentDistribution | undefined> {
+    const [distribution] = await db
+      .select()
+      .from(sentimentDistribution)
+      .where(eq(sentimentDistribution.senderId, senderId))
+      .orderBy(desc(sentimentDistribution.createdAt))
+      .limit(1);
+    return distribution;
+  }
+  
+  async createSentimentDistribution(sentiment: InsertSentimentDistribution): Promise<SentimentDistribution> {
+    const [newDistribution] = await db
+      .insert(sentimentDistribution)
+      .values({
+        ...sentiment,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      })
+      .returning();
+    return newDistribution;
+  }
+  
+  async updateSentimentDistribution(id: number, data: Partial<SentimentDistribution>): Promise<SentimentDistribution | undefined> {
+    const [updatedDistribution] = await db
+      .update(sentimentDistribution)
+      .set({ 
+        ...data, 
+        updatedAt: new Date() 
+      })
+      .where(eq(sentimentDistribution.id, id))
+      .returning();
+    return updatedDistribution;
+  }
+  
+  // Instagram Mapping operations (for dynamic Instagram-to-Facebook mapping)
+  async getInstagramMapping(instagramId: string): Promise<InstagramMapping | undefined> {
+    try {
+      const [mapping] = await db
+        .select()
+        .from(instagramMappings)
+        .where(
+          and(
+            eq(instagramMappings.instagramId, instagramId),
+            eq(instagramMappings.status, "active")
+          )
+        );
+      return mapping;
+    } catch (error) {
+      console.error(`[storage] Error getting Instagram mapping: ${error}`);
+      return undefined;
+    }
+  }
+  
+  async getAllInstagramMappings(): Promise<InstagramMapping[]> {
+    try {
+      const mappings = await db
+        .select()
+        .from(instagramMappings)
+        .where(eq(instagramMappings.status, "active"));
+      return mappings;
+    } catch (error) {
+      console.error(`[storage] Error getting all Instagram mappings: ${error}`);
+      return [];
+    }
+  }
+  
+  async createInstagramMapping(mapping: InsertInstagramMapping): Promise<InstagramMapping> {
+    try {
+      const [newMapping] = await db
+        .insert(instagramMappings)
+        .values({
+          ...mapping,
+          createdAt: new Date()
+        })
+        .returning();
+      return newMapping;
+    } catch (error) {
+      console.error(`[storage] Error creating Instagram mapping: ${error}`);
+      throw error;
+    }
+  }
+  
+  async updateInstagramMapping(id: number, data: Partial<InstagramMapping>): Promise<InstagramMapping | undefined> {
+    try {
+      const [updatedMapping] = await db
+        .update(instagramMappings)
+        .set(data)
+        .where(eq(instagramMappings.id, id))
+        .returning();
+      return updatedMapping;
+    } catch (error) {
+      console.error(`[storage] Error updating Instagram mapping: ${error}`);
+      return undefined;
+    }
+  }
+  
+  async deleteInstagramMapping(instagramId: string): Promise<boolean> {
+    try {
+      await db
+        .update(instagramMappings)
+        .set({ status: "inactive" })
+        .where(eq(instagramMappings.instagramId, instagramId));
+      return true;
+    } catch (error) {
+      console.error(`[storage] Error deleting Instagram mapping: ${error}`);
+      return false;
+    }
+  }
+}
+
+// Use database storage implementation
+export const storage = new DatabaseStorage();
